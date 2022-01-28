@@ -1,0 +1,1210 @@
+---
+title: "IBP_essential_gene"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+    number_sections: yes
+---
+
+```{r}
+list.of.packages = c("readxl", "httr", "jsonlite","ggplot2","ggpubr","VennDiagram",
+                     "RColorBrewer","plyr","dplyr","gridExtra","tidyr","corrplot")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+for (p in list.of.packages) library(p, character.only = TRUE)
+```
+
+```{r}
+path_to_data = paste(getwd(),"/data/", sep = "")
+path_to_essential_genes = paste(path_to_data, "Essential_genes_human.xlsx", sep = "")
+path_to_meltome = paste(path_to_data, "human.csv", sep = "")
+path_to_chap_AP = paste(path_to_data, "chaperone_interactors_AP-MS.xlsx", sep = "")
+path_to_chap_BIO = paste(path_to_data, "chaperone_interactors_BioID.xlsx", sep = "")
+
+path_to_output = paste(getwd(),"/output/", sep = "")
+path_to_uniprot_mapping = paste(path_to_output, "uniprot_mapping.csv", sep = "")
+path_to_uniprot_mapping_essential = paste(path_to_output, "uniprot_mapping_essential.csv", sep = "")
+path_to_APRcounts_TANGOscores = paste(path_to_output, "APRcounts_TANGOscores.csv", sep = "")
+```
+
+```{r}
+load(paste(path_to_data, "human_proteome_df.RData", sep = ""))
+human_proteome_tbl <- as_tibble(human_proteome)
+```
+
+# Convert UniProt ID to gene name (with Uniprot RESTful API)
+
+```{r}
+UniProtLookUp <- function(human_proteome) {
+  
+  prot_list <- levels(unique(human_proteome$Protein))
+  query <- paste(prot_list, collapse = " ")
+  
+  url <- "https://www.uniprot.org/uploadlists/"
+  
+  body <- list(
+    from = "ACC+ID",
+    to = 'GENENAME',
+    format = "tab",
+    query = query
+  )
+  
+  raw.result <- POST(url = url, body = body, encode = "form")
+  
+  if (raw.result$status_code == 200) {
+    read.delim(text = content(raw.result, encoding = "UTF-8"))
+  }
+}
+```
+
+Read from previous results, or generate new.
+
+```{r}
+if (file.exists(path_to_uniprot_mapping)) {
+  uniprot_mapping <- read.csv(path_to_uniprot_mapping)
+} else {
+  uniprot_mapping <- UniProtLookUp(human_proteome)
+  colnames(uniprot_mapping) <- c('Protein', 'Gene')
+  uniprot_mapping$gene <- sapply(uniprot_mapping$Gene, function(x) strsplit(x, '-')[[1]][1])
+  write.csv(uniprot_mapping,file=paste(path_to_output,"uniprot_mapping.csv",sep=''),row.names=F)
+}
+head(uniprot_mapping)
+```
+
+# Essential Gene Mapping
+
+## Explore DEG database
+
+```{r}
+DEG_overview <- read.delim(paste(path_to_data, "deg_eukaryotes.txt", sep=''))
+DEG_overview <- DEG_overview[DEG_overview$Organism=="Homo sapiens",]
+DEG_overview$Reference = as.factor(DEG_overview$Reference)
+levels(DEG_overview$Reference) = sapply(levels(DEG_overview$Reference), function(x) strsplit(x, split = ',')[[1]][1])
+DEG_overview
+```
+
+DEG2022 is removed, since all other datasets from the Hart paper uses CRISPR.
+
+```{r}
+essential_genes_human <- read_excel(path_to_essential_genes, col_names=F)
+essential_genes_human <- essential_genes_human[,c(1,3)]
+colnames(essential_genes_human) <- c("ID","Gene")
+essential_genes_human <- essential_genes_human[!(essential_genes_human$ID=="DEG2022"),]
+essential_genes_human <- merge(essential_genes_human, DEG_overview[,c("Reference","ID")])
+head(essential_genes_human, 100)
+```
+
+Find the intersection essential gene set between datasets for each paper.
+
+```{r}
+gene_count <- as_tibble(essential_genes_human) %>%
+  group_by(Reference, Gene) %>%
+  summarise(Gene_count = n())
+ID_count <- as_tibble(essential_genes_human) %>%
+  group_by(Reference) %>%
+  summarise(ID = unique(ID)) %>%
+  summarise(ID_count = n())
+essential_genes_human <- merge(gene_count, ID_count) %>%
+  mutate(essential = Gene_count/ID_count > 0.5) %>%
+  filter(essential) %>%
+  select(Reference, Gene)
+essential_genes_human %>% count(Reference)
+```
+
+Similarity between datasets calculated as number of shared genes divided by number of total genes.
+
+```{r}
+pp <- 1-dist(table(essential_genes_human$Reference,essential_genes_human$Gene),method="binary")
+corrplot(as.matrix(pp), is.cor = F, type= 'lower', method="color",
+         col=colorRampPalette(c("skyblue2","royalblue4"))(200))
+```
+
+How similar is it in between the 4 most similar papers?
+
+```{r}
+draw_venn <- function(pos) {
+  category.names = levels(essential_genes_human$Reference)[pos]
+  x = lapply(category.names, function(x) as.vector(essential_genes_human$Gene[essential_genes_human$Reference==x]))
+  myCol = brewer.pal(length(pos), "Pastel2")
+  
+  grid.newpage()
+  venn_object <- venn.diagram(
+    x = x,
+    category.names = category.names,
+    filename = NULL,
+    output=TRUE,
+          # Output features
+          imagetype="png" ,
+          height = 480 , 
+          width = 480 , 
+          resolution = 300,
+          compression = "lzw",
+          
+          # Circles
+          lwd = 2,
+          lty = 'blank',
+          fill = myCol,
+    
+          # Extra
+          disable.logging = T
+  )
+  
+  grid.draw(venn_object)
+}
+
+draw_venn(c(3,5,8,9)) # Plotting the 4 papers with highest similarity
+```
+
+
+## Mapping gene essentiality from DEG to human_proteome dataframe
+
+Count the number of occurrence for each gene across papers. If it appears in 4 or more papers, it is considered essential. 
+
+```{r}
+essential_genes_count <- as.data.frame(table(essential_genes_human$Gene))
+colnames(essential_genes_count) <- c('Gene', 'essential')
+head(essential_genes_count, 100)
+```
+
+Number of essential genes
+
+```{r}
+uniprot_mapping_essential <- merge(uniprot_mapping, essential_genes_count, by="Gene", all.x=T)
+uniprot_mapping_essential$essential <- ifelse(uniprot_mapping_essential$essential >= 4, T, F)
+uniprot_mapping_essential[is.na(uniprot_mapping_essential)] <- F
+protein_mapping_essential <- unique(uniprot_mapping_essential[c('Protein','essential')])
+sum(protein_mapping_essential$essential)
+```
+
+```{r}
+# write.csv(uniprot_mapping_essential, file = paste(path_to_output, "uniprot_mapping_essential.csv", sep=""),row.names=F)
+```
+
+# Investigate potential bias factors and removal
+
+## Signaling peptides
+
+Since signaling peptides tend to be hydrophobic and are cleaved after processing, they should be removed.
+
+## Transmembrane helices / domain
+
+Are all APRs either transmembrane helices or not?
+
+```{r}
+human_proteome_tbl %>% 
+  filter(APRcount_tango > 0) %>% 
+  group_by(APRcount_tango, TMHMM) %>% 
+  summarize(count = n()) %>% 
+  spread("TMHMM","count", fill=0) %>% 
+  mutate(TMHMM_percent = Yes/(Yes+No)) %>% 
+  group_by(TMHMM_percent) %>%
+  count()
+```
+
+Almost all APRs are either completely transmembrane or not. They will be modeled as binary variable later on.  
+
+Does transmembrane helices / domains affect TANGO statistics?
+
+```{r}
+APRstats <- human_proteome_tbl %>%
+  filter(APRcount_tango > 0) %>%
+  group_by(Protein,APRcount_tango) %>%
+  summarise(avgTango = max(avgScore),
+            TMHMM = unique(ifelse(TMHMM=="Yes",T,F)),
+            TMHMM_domain = unique(ifelse(TMHMM_domain=="Yes",T,F)))
+
+APRstats <- merge(APRstats, protein_mapping_essential, by = 'Protein')
+
+head(APRstats, 100)
+```
+
+```{r}
+p <- ggplot(APRstats,aes(x=avgTango, group_by=essential, color=essential))
+p + geom_boxplot() + facet_grid("TMHMM") + ggtitle("Average TANGO score, based on TMHMM helices") + theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+p <- ggplot(APRstats,aes(x=avgTango, group_by=essential, color=essential))
+p + geom_boxplot() + facet_grid("TMHMM_domain") + ggtitle("Average TANGO score, based on TMHMM domains") + theme(plot.title=element_text(hjust=0.5))
+```
+
+From the graph above, transmembrane helices / domains tend to receive higher influence from gene essentiality. Since this study focuses more on cytosolic aggregation, proteins containing these should be removed.
+
+# TANGO Statistics Analysis
+
+## Filter the transmembrane and signal peptides
+
+```{r}
+human_proteome_tbl <- human_proteome_tbl %>%
+  filter(TMHMM== 'No', SignalP == 'No')
+```
+
+```{r}
+APR_new <- human_proteome_tbl %>%
+  group_by(Protein) %>%
+  summarise(APRcount = ifelse(max(APRcount_tango)==0, 0, max(APRcount_tango)-min(APRcount_tango[APRcount_tango>0])+1),
+            maxTango = max(maxProtscore), protein_length = max(protein_length)) %>%
+  mutate(normalizedAPRcount = APRcount/protein_length*100) #filter(TMHMM)
+
+averageAPRcount <- human_proteome_tbl %>%
+  filter(APRcount_tango > 0) %>%
+  group_by(Protein, APRcount_tango) %>%
+  summarise(avgTango = max(avgScore)) %>%
+  group_by(Protein) %>%
+  summarise(avgTango = mean(avgTango))
+
+APRcounts_TANGOscores <- merge(APR_new, averageAPRcount, by = 'Protein')
+APRcounts_TANGOscores <- merge(APRcounts_TANGOscores, protein_mapping_essential, by = 'Protein')
+```
+
+## APR count analysis
+
+```{r}
+p <- ggplot(APRcounts_TANGOscores,aes(y=normalizedAPRcount, x=essential, group_by=essential, color=essential))
+p + geom_boxplot(notch=T) + ggtitle("APR counts: Essential vs. Non-essential genes") + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means()
+```
+
+The plot above shows both essential and non-essential genes' APR counts.
+
+```{r}
+means <- ddply(APRcounts_TANGOscores, "essential", summarise, grp.mean=mean(normalizedAPRcount))
+means
+```
+
+```{r}
+q <- ggplot(APRcounts_TANGOscores,aes(x=normalizedAPRcount,color=essential))
+q + geom_density(size=0.8) + geom_vline(data=means, aes(xintercept=grp.mean, color=essential), linetype="dashed") + ggtitle("Normalized APR count with means") + theme(plot.title=element_text(hjust=0.5))
+```
+
+The plot above shows the density of a particular APRcount for essential and non-essential genes, with the means displayed as dashed lines.
+
+```{r}
+medians <- ddply(APRcounts_TANGOscores, "essential", summarise, grp.median=median(normalizedAPRcount))
+medians
+```
+
+```{r}
+q <- ggplot(APRcounts_TANGOscores,aes(x=normalizedAPRcount,color=essential))
+q + geom_density(size=0.8) + geom_vline(data=medians, aes(xintercept=grp.median, color=essential), linetype="dashed") + ggtitle("Normalized APR count with medians") + theme(plot.title=element_text(hjust=0.5))
+```
+
+## TANGO score analysis
+
+Plot the values of the average and maximum Tango scores to see how they are distributed.
+
+```{r}
+no0values <- subset(APRcounts_TANGOscores, avgTango!=0 & maxTango!=0)
+
+ggplot(no0values,aes(x=avgTango,color=essential)) +
+  geom_density() + ggtitle("Average TANGO per protein") +
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+ggplot(no0values,aes(x=maxTango,color=essential)) + geom_density() + 
+  ggtitle("Maximum TANGO per protein") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+ggplot(no0values,aes(y=avgTango,x=essential,color=essential)) +
+  geom_boxplot(notch = T) + ggtitle("Average TANGO per protein") + 
+  theme(plot.title=element_text(hjust=0.5)) + stat_compare_means()
+```
+
+```{r}
+ggplot(no0values,aes(y=maxTango,x=essential,color=essential)) +
+  geom_boxplot(notch = T) + ggtitle("Maximum TANGO per protein") + 
+  theme(plot.title=element_text(hjust=0.5)) + stat_compare_means()
+```
+
+## TANGO score per APR
+
+Are the scores of the APRs lower in essential genes?
+
+```{r}
+all_APR_scores <- human_proteome_tbl %>%
+  group_by(Protein) %>%
+  filter(APRdef_tango == "APR") %>%
+  summarise(TANGO_scores_per_APR = unique(avgScore))
+all_APR_scores <- merge(all_APR_scores, protein_mapping_essential, by = 'Protein')
+all_APR_scores
+```
+
+```{r}
+ggplot(all_APR_scores,aes(y=TANGO_scores_per_APR, x=essential, color=essential)) + 
+  geom_boxplot(notch=T) + 
+  ggtitle("TANGO scores for each APR") + 
+  theme(plot.title=element_text(hjust=0.5)) + 
+  stat_compare_means()
+```
+
+```{r}
+mean_APR_scores <- all_APR_scores %>%
+  group_by(essential) %>%
+  summarize(mean_TANGO_scores = mean(TANGO_scores_per_APR))
+mean_APR_scores
+```
+
+```{r}
+ggplot(all_APR_scores,aes(x=TANGO_scores_per_APR,color=essential)) + 
+  geom_density() +
+  geom_vline(data=mean_APR_scores, aes(xintercept=mean_TANGO_scores, color=essential), linetype="dashed") + 
+  ggtitle("all APR TANGO scores") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+median_APR_scores <- all_APR_scores %>%
+  group_by(essential) %>%
+  summarize(median_TANGO_scores = median(TANGO_scores_per_APR))
+median_APR_scores
+```
+
+```{r}
+ggplot(all_APR_scores,aes(x=TANGO_scores_per_APR,color=essential)) + 
+  geom_density() +
+  geom_vline(data=median_APR_scores, aes(xintercept=median_TANGO_scores, color=essential), linetype="dashed") + 
+  ggtitle("all APR TANGO scores") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+# Protein length analysis
+
+```{r}
+prot_length <- human_proteome_tbl  %>% 
+  count(Protein)
+colnames(prot_length)[2] <- "prot_length"
+prot_length <-  merge(prot_length, APRcounts_TANGOscores[,c("Protein","avgTango", "normalizedAPRcount", "essential")], by="Protein")
+prot_length
+```
+
+```{r}
+ggplot(prot_length,aes(y=prot_length,x=essential,color=essential)) + 
+  geom_boxplot(notch=T) + 
+  stat_compare_means()
+```
+
+```{r}
+mean_length_tango <- prot_length %>%
+  group_by(essential) %>%
+  summarize(prot_length_mean = mean(prot_length), avgTango = mean(avgTango))
+mean_length_tango
+```
+
+```{r}
+ggplot(prot_length,aes(x=prot_length,color=essential)) + geom_density() +
+  geom_vline(data=mean_length_tango, aes(xintercept=prot_length_mean, color=essential), linetype="dashed") + 
+  ggtitle("Protein lengths") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+same plot as above but removing high values
+
+```{r}
+ggplot(prot_length,aes(x=prot_length,color=essential)) + 
+  xlim(0, 2500) +
+  geom_density() +
+  geom_vline(data=mean_length_tango, aes(xintercept=prot_length_mean, color=essential), linetype="dashed") + 
+  ggtitle("Protein lengths") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+(((i think these next 3 plots we can remove)))
+
+```{r}
+ggplot(prot_length, aes(x=prot_length, y=avgTango, color=essential)) + 
+  geom_point() + 
+  ggtitle("Protein length vs mean tango scores") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+ggplot(prot_length, aes(x=prot_length, y=normalizedAPRcount, color=essential)) +
+  geom_point()  + 
+  ggtitle("Protein length vs APR count per protein") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+ggplot(prot_length, aes(x=avgTango, y=normalizedAPRcount, color=essential)) +
+  geom_point()  + 
+  ggtitle("Mean tango score vs APR count per protein") + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+# Gatekeeper Residue Analysis
+
+```{r}
+Gatekeeper_residues <- human_proteome_tbl %>% filter(APRdef_tango=="GK")
+Gatekeeper_residues <- Gatekeeper_residues[,c(1,3,4,5,6,10,11)]
+Gatekeeper_residues <- merge(Gatekeeper_residues, protein_mapping_essential)
+```
+
+## Exploratory analysis
+
+Count gatekeeper residues in essential and non-essential genes
+
+```{r}
+Gatekeeper_residues %>%
+  count(Residue, essential)
+
+ddply(Gatekeeper_residues, "essential", summarise, grp.mean=mean(tango_Score))
+```
+
+```{r}
+GKstats <- human_proteome_tbl %>%
+  filter(APRcount_tango > 0, APRdef_tango == "GK") %>%
+  select(Protein,APRcount_tango,Residue,Position) %>%
+  mutate(charged = if_else(Residue %in% c("D","E","R","K"),T,F),
+         negative = if_else(Residue %in% c("D","E"),T,F)) %>%
+  group_by(Protein, APRcount_tango) %>%
+  summarise(n_charged = sum(charged),
+            n_protective = sum(negative))
+GKstats <- merge(GKstats,protein_mapping_essential,all.x=T)
+GKstats$essential[is.na(GKstats$essential)] <- F
+GKstats
+```
+
+```{r}
+a <- gghistogram(GKstats,"n_charged","..density..",
+                 fill = "cyan",
+                 color = "grey",
+                 xlab = "Number of charged residues per APR",
+                 facet.by = "essential",
+                 add = "mean",
+                 bins = 3)
+b <- gghistogram(GKstats,"n_protective","..density..",
+                 fill = "blue",
+                 color = "grey",
+                 xlab = "Number of protective residues per APR",
+                 facet.by = "essential",
+                 add = "mean",
+                 bins = 3)
+ggarrange(a, b + rremove("ylab"), ncol = 2)
+```
+
+## Analysis based on all APRs
+
+Creates dataframe of gatekeeper residues of each protein. Each column represents average number of GK residues per APR per protein.
+
+```{r}
+GK <- Gatekeeper_residues %>%
+  group_by(Protein) %>%
+  mutate(n_APR = max(APRcount_tango)-min(APRcount_tango)+1) %>%
+  count(Protein, Residue, essential, n_APR) %>%
+  mutate(normalizedCount = n/n_APR) %>%
+  select(-c(n)) %>%
+  spread(key="Residue", value='normalizedCount', fill=0)
+GK
+```
+
+Distribution of GK residues between essential or nonessential genes
+
+```{r}
+df <- Gatekeeper_residues %>%
+  count(Residue, essential) %>%
+  arrange(Residue) %>%
+  mutate(prop=ifelse(essential,
+                     n/nrow(Gatekeeper_residues[Gatekeeper_residues$essential,]),
+                     n/nrow(Gatekeeper_residues[!Gatekeeper_residues$essential,])))
+  
+ggplot(df,aes(x=essential, y=prop, fill=Residue)) +
+  geom_bar(stat="identity", width=0.9) +
+  ylab("Proportion of Gatekeeper Residues") +
+  coord_flip() +
+  guides(fill = guide_legend(ncol = 2))
+```
+
+```{r}
+df <- GK %>% select(Protein:n_APR, D, E, R, K) %>% gather(key = "GK", value = "norm_Count", D:K) %>% arrange(Protein,GK)
+df
+```
+
+
+```{r}
+ggplot(df, aes(x=GK, y=norm_Count, fill=essential)) + 
+    geom_boxplot(notch = T) + xlab("Gatekeeper Residue") + ylab("Average Count per APR per Protein") +
+  stat_compare_means(method = "wilcox.test", label = "p.format", label.y = 2.5)
+```
+
+In conclusion, both aspartate, arginine, and lysine GKs are significantly more abundant in essential proteins.
+
+## Analysis based on effective/ineffective APRs
+
+Effective APRs are defined as APRs with at least 1 charged gatekeepers.
+
+```{r}
+GKstats <- GKstats %>% mutate(effective = n_charged >= 1)
+
+ggplot(GKstats, aes(y = essential, fill = effective)) + geom_bar(position = "fill") + ggtitle("Distribution of effective APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+
+Essential APRs are more often also effective APRs.
+
+Creates dataframe by filtering APRs containing at least 1 charged GK residue. Each column represents average number of GK residues per APR per protein.
+
+```{r}
+criterion <- GKstats %>%
+  filter(n_charged >= 1) %>%
+  select(APRcount_tango)
+
+Effective_GKs <- merge(criterion, Gatekeeper_residues)
+
+GK_eff <- Effective_GKs %>%
+  group_by(Protein) %>%
+  mutate(n_APR = max(APRcount_tango)-min(APRcount_tango)+1) %>%
+  count(Protein, Residue, essential, n_APR) %>%
+  mutate(normalizedCount = n/n_APR) %>%
+  select(-c(n)) %>%
+  spread(key="Residue", value='normalizedCount', fill=0)
+GK_eff
+```
+
+Distribution of GK residues
+
+```{r}
+df <- Effective_GKs %>%
+  count(Residue, essential) %>%
+  arrange(Residue) %>%
+  mutate(prop=ifelse(essential,
+                     n/nrow(Effective_GKs[Effective_GKs$essential,]),
+                     n/nrow(Effective_GKs[!Effective_GKs$essential,])))
+  
+ggplot(df,aes(x=essential, y=prop, fill=Residue)) +
+  geom_bar(stat="identity", width=0.9) +
+  coord_flip() +
+  guides(fill = guide_legend(ncol = 2))
+```
+
+```{r}
+df <- GK_eff %>% select(Protein:n_APR, D, E, R, K) %>% gather(key = "GK", value = "norm_Count", D:K) %>% arrange(Protein,GK)
+df
+```
+
+
+```{r}
+ggplot(df, aes(x=GK, y=norm_Count, fill=essential)) + 
+    geom_boxplot(notch = T) + xlab("Gatekeeper Residue") + ylab("Average Count per APR per Protein") +
+  stat_compare_means(method = "wilcox.test", label = "p.format", label.y = 2.5)
+```
+
+When only effective APRs are considered, none of the four residues have significant differences, except that mean normalized count of aspartate GKs is significantly higher in essential proteins. This means 
+
+## Analysis based on protective/unprotective APRs
+
+```{r}
+Protective_GKs <- Gatekeeper_residues[((Gatekeeper_residues$Residue == "D") | (Gatekeeper_residues$Residue == "E")),]
+Unprotective_GKs <- Gatekeeper_residues[!((Gatekeeper_residues$Residue == "D") | (Gatekeeper_residues$Residue == "E")),]
+
+Protective_GKs %>% count(essential)
+Unprotective_GKs %>% count(essential)
+
+ddply(Protective_GKs, "essential", summarise, grp.mean=mean(tango_Score))
+ddply(Unprotective_GKs, "essential", summarise, grp.mean=mean(tango_Score))
+```
+
+```{r}
+ggdensity(Protective_GKs, x="tango_Score", add="mean", rug=TRUE, color="essential", size=1)
+```
+
+The graph above can be visualized more clearly in a box plot, as seen below. From the rug of this density plot, we can see that there is a high degree of overlap in the Tango scores of the protective gatekeepers.
+
+```{r}
+box1 <- ggboxplot(Protective_GKs, x="essential", y="tango_Score", color="essential", add="jitter", shape="essential")
+box1
+box1 + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.y=50)
+```
+
+From the box plot above, we can see that while visually there does not seem to be a significant difference between the Tango scores of protective gatekeepers in essential and non-essential proteins, the p-value is significant. Therefore, there is a distinct difference in the Tango scores of protective gatekeepers (residues D & E) between essential and nonessential proteins.
+
+```{r}
+box2 <- ggboxplot(Unprotective_GKs, x="essential", y="tango_Score", color="essential", add="jitter", shape="essential")
+box2
+box2 + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.y=50)
+```
+
+In the case of un-protective gatekeepers (i.e., positive and uncharged residues), there is no significant difference in the Tango scores between essential and nonessential proteins.
+
+```{r}
+Gatekeeper_status <- Gatekeeper_residues %>%
+  summarise(Protect = ifelse((Residue=="D")|(Residue=="E"), "Yes", "No"))
+
+Gatekeeper_protection <- Gatekeeper_residues
+Gatekeeper_protection$Protect <- Gatekeeper_status$Protect
+head(Gatekeeper_protection)
+```
+
+```{r}
+ggplot(Gatekeeper_protection, aes(y = essential, fill = Protect)) + geom_bar(position = "fill") + ggtitle("Distribution of protective & unprotective GKs") + theme(plot.title=element_text(hjust=0.5))
+```
+
+# TANGO + GK Combined Analysis
+
+## Analysis in essential genes
+
+```{r}
+Essential_APRs <- GKstats[(GKstats$essential==TRUE),]
+head(Essential_APRs)
+```
+
+```{r}
+ggplot(Essential_APRs, aes(y = n_charged)) + geom_bar() + ggtitle("Distribution of protective & unprotective GKs") + theme(plot.title=element_text(hjust=0.5))
+```
+This graph looks at the distribution of charged gatekeepers in APRs in essential genes.
+
+```{r}
+essentialAPR_counts <- Essential_APRs %>%
+  count(n_charged)
+essentialAPRcount_noFilter <- essentialAPR_counts %>%
+  mutate(perc = n / sum(n) * 100)
+colnames(essentialAPRcount_noFilter)[1] <- "charge"
+essentialAPRcount_noFilter <- essentialAPRcount_noFilter[,-2]
+essentialAPRcount_noFilter
+
+ggplot(essentialAPRcount_noFilter, aes(x="", y=perc, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Distribution of protective & unprotective GKs") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+From this, it can be seen that the majority of gatekeeper residues are uncharged amino acids, after which positive and then negative amino acids come around.
+
+```{r}
+GKstats2 <- human_proteome_tbl %>%
+  filter(APRcount_tango > 0, APRdef_tango == "GK") %>%
+  select(Protein,APRcount_tango,Residue,Position,avgScore) %>%
+  mutate(charged = if_else(Residue %in% c("D","E","R","K"),T,F),
+         negative = if_else(Residue %in% c("D","E"),T,F)) %>%
+  group_by(APRcount_tango) %>%
+  summarise(Protein = Protein,
+            avgScore = avgScore,
+            charged = prod(charged),
+            charge = sum(negative))
+GKstats2 <- merge(GKstats2,protein_mapping_essential,all.x=T)
+head(GKstats2)
+
+EssentialAPRs_filtered20 <- GKstats2[(GKstats2$essential==TRUE & GKstats2$avgScore > 20),]
+EssentialAPRs_filtered20 <- EssentialAPRs_filtered20[complete.cases(EssentialAPRs_filtered20),]
+head(EssentialAPRs_filtered20)
+
+essentialAPRcount_filtered20 <- EssentialAPRs_filtered20 %>%
+  count(charge)
+essentialAPRcount_filtered20 <- essentialAPRcount_filtered20 %>%
+  mutate(perc20 = n / sum(n) * 100)
+essentialAPRcount_filtered20 <- essentialAPRcount_filtered20[,-2]
+essentialAPRcount_filtered20
+
+ggplot(essentialAPRcount_filtered20, aes(x="", y=perc20, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 20)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+```{r}
+EssentialAPRs_filtered40 <- GKstats2[(GKstats2$essential==TRUE & GKstats2$avgScore > 40),]
+EssentialAPRs_filtered40 <- EssentialAPRs_filtered40[complete.cases(EssentialAPRs_filtered40),]
+head(EssentialAPRs_filtered40)
+
+essentialAPRcount_filtered40 <- EssentialAPRs_filtered40 %>%
+  count(charge)
+essentialAPRcount_filtered40 <- essentialAPRcount_filtered40 %>%
+  mutate(perc40 = n / sum(n) * 100)
+essentialAPRcount_filtered40 <- essentialAPRcount_filtered40[,-2]
+essentialAPRcount_filtered40
+
+ggplot(essentialAPRcount_filtered40, aes(x="", y=perc40, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 40)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+```{r}
+EssentialAPRs_filtered60 <- GKstats2[(GKstats2$essential==TRUE & GKstats2$avgScore > 60),]
+EssentialAPRs_filtered60 <- EssentialAPRs_filtered60[complete.cases(EssentialAPRs_filtered60),]
+head(EssentialAPRs_filtered60)
+
+essentialAPRcount_filtered60 <- EssentialAPRs_filtered60 %>%
+  count(charge)
+essentialAPRcount_filtered60 <- essentialAPRcount_filtered60 %>%
+  mutate(perc60 = n / sum(n) * 100)
+essentialAPRcount_filtered60 <- essentialAPRcount_filtered60[,-2]
+essentialAPRcount_filtered60
+
+ggplot(essentialAPRcount_filtered60, aes(x="", y=perc60, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 60)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+```{r}
+EssentialAPRs_filtered80 <- GKstats2[(GKstats2$essential==TRUE & GKstats2$avgScore > 80),]
+EssentialAPRs_filtered80 <- EssentialAPRs_filtered80[complete.cases(EssentialAPRs_filtered80),]
+head(EssentialAPRs_filtered80)
+
+essentialAPRcount_filtered80 <- EssentialAPRs_filtered80 %>%
+  count(charge)
+essentialAPRcount_filtered80 <- essentialAPRcount_filtered80 %>%
+  mutate(perc80 = n / sum(n) * 100)
+essentialAPRcount_filtered80 <- essentialAPRcount_filtered80[,-2]
+essentialAPRcount_filtered80
+
+ggplot(essentialAPRcount_filtered80, aes(x="", y=perc80, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 80)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+
+The table below shows the percentage of charged gatekeepers as we filter by TANGO score
+
+```{r}
+essentialAPR_counts <- merge(essentialAPRcount_noFilter, essentialAPRcount_filtered20, by="charge")
+essentialAPR_counts <- merge(essentialAPR_counts, essentialAPRcount_filtered40, by="charge")
+essentialAPR_counts <- merge(essentialAPR_counts, essentialAPRcount_filtered60, by="charge")
+essentialAPR_counts <- merge(essentialAPR_counts, essentialAPRcount_filtered80, by="charge")
+essentialAPR_counts
+```
+
+```{r}
+colnames(essentialAPRcount_filtered20)[2] <- c('perc')
+colnames(essentialAPRcount_filtered40)[2] <- c('perc')
+colnames(essentialAPRcount_filtered60)[2] <- c('perc')
+colnames(essentialAPRcount_filtered80)[2] <- c('perc')
+
+essentialAPR_counts_new <- essentialAPR_counts
+essentialAPR_counts_new <- essentialAPR_counts_new[,c(1,2)]
+essentialAPR_counts_new <- rbind(essentialAPR_counts_new,essentialAPRcount_filtered20,essentialAPRcount_filtered40,essentialAPRcount_filtered60,essentialAPRcount_filtered80)
+essentialAPR_counts_new['cutoff'] <- c('perc','perc','perc','perc20','perc20','perc20','perc40','perc40','perc40','perc60','perc60','perc60','perc80','perc80','perc80')
+
+ggplot(data=essentialAPR_counts_new, aes(x=charge,y=perc,group=cutoff)) + geom_line(aes(linetype=cutoff)) + geom_point(aes(shape=cutoff)) + ggtitle("Gatekeeper charge distrbution across APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+The graph above shows the percentage of gatekeepers that have no charge overall because of a mix of positive and negative GKs (charge=1), positive (charge=0) and negative (charge=2). Between a TANGO score cutoff of 20 and 60, the percentages seem to follow a fairly similar pattern visually.
+
+```{r}
+negativeGK_perc <- essentialAPR_counts_new[(essentialAPR_counts_new$charge==2),]
+negativeGK_perc['cutoff_num'] <- c(0,20,40,60,80)
+ggplot(data=negativeGK_perc, aes(x=cutoff_num,y=perc)) + geom_line() + geom_point() + ggtitle("Proportion of protective GKs in APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+This graph zooms in on the percentage of negative gatekeepers (on both sides), i.e., protective gatekeepers, with different TANGO score cutoffs on each APR's average TANGO score.
+
+```{r}
+positiveGK_perc <- essentialAPR_counts_new[(essentialAPR_counts_new$charge==0),]
+positiveGK_perc['cutoff_num'] <- c(0,20,40,60,80)
+ggplot(data=positiveGK_perc, aes(x=cutoff_num,y=perc)) + geom_line() + geom_point() + ggtitle("Proportion of (only) positive GKs in APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+Interestingly, the percentage of APRs with completely positively charged gatekeepers increases sharply as APR strength increases but then shows a decreasing pattern once again. The higher percentage of only positive gatekeepers could indicate or be due to chaperones being involved in protein folding.
+
+## Analysis in non-essential genes
+
+```{r}
+Nonessential_APRs <- GKstats[(GKstats$essential==FALSE),]
+head(Nonessential_APRs)
+```
+
+```{r}
+ggplot(Nonessential_APRs, aes(y = n_charged)) + geom_bar() + ggtitle("Distribution of protective & unprotective GKs") + theme(plot.title=element_text(hjust=0.5))
+```
+This graph looks at the distribution of charged gatekeepers in APRs in essential genes.
+
+```{r}
+nonessentialAPR_counts <- Nonessential_APRs %>%
+  count(n_charged)
+nonessentialAPRcount_noFilter <- nonessentialAPR_counts %>%
+  mutate(perc = n / sum(n) * 100)
+colnames(nonessentialAPRcount_noFilter)[1] <- "charge"
+nonessentialAPRcount_noFilter <- nonessentialAPRcount_noFilter[,-2]
+nonessentialAPRcount_noFilter
+
+ggplot(nonessentialAPRcount_noFilter, aes(x="", y=perc, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Distribution of protective & unprotective GKs") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+
+```{r}
+NonessentialAPRs_filtered20 <- GKstats2[(GKstats2$essential==FALSE & GKstats2$avgScore > 20),]
+NonessentialAPRs_filtered20 <- NonessentialAPRs_filtered20[complete.cases(NonessentialAPRs_filtered20),]
+head(NonessentialAPRs_filtered20)
+
+nonessentialAPRcount_filtered20 <- NonessentialAPRs_filtered20 %>%
+  count(charge)
+nonessentialAPRcount_filtered20 <- nonessentialAPRcount_filtered20 %>%
+  mutate(perc20 = n / sum(n) * 100)
+nonessentialAPRcount_filtered20 <- nonessentialAPRcount_filtered20[,-2]
+nonessentialAPRcount_filtered20
+
+ggplot(nonessentialAPRcount_filtered20, aes(x="", y=perc20, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 20)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+```{r}
+NonessentialAPRs_filtered40 <- GKstats2[(GKstats2$essential==FALSE & GKstats2$avgScore > 40),]
+NonessentialAPRs_filtered40 <- NonessentialAPRs_filtered40[complete.cases(NonessentialAPRs_filtered40),]
+head(NonessentialAPRs_filtered40)
+
+nonessentialAPRcount_filtered40 <- NonessentialAPRs_filtered40 %>%
+  count(charge)
+nonessentialAPRcount_filtered40 <- nonessentialAPRcount_filtered40 %>%
+  mutate(perc40 = n / sum(n) * 100)
+nonessentialAPRcount_filtered40 <- nonessentialAPRcount_filtered40[,-2]
+nonessentialAPRcount_filtered40
+
+ggplot(nonessentialAPRcount_filtered40, aes(x="", y=perc40, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 40)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+```{r}
+NonessentialAPRs_filtered60 <- GKstats2[(GKstats2$essential==FALSE & GKstats2$avgScore > 60),]
+NonessentialAPRs_filtered60 <- NonessentialAPRs_filtered60[complete.cases(NonessentialAPRs_filtered60),]
+head(NonessentialAPRs_filtered60)
+
+nonessentialAPRcount_filtered60 <- NonessentialAPRs_filtered60 %>%
+  count(charge)
+nonessentialAPRcount_filtered60 <- nonessentialAPRcount_filtered60 %>%
+  mutate(perc60 = n / sum(n) * 100)
+nonessentialAPRcount_filtered60 <- nonessentialAPRcount_filtered60[,-2]
+nonessentialAPRcount_filtered60
+
+ggplot(nonessentialAPRcount_filtered60, aes(x="", y=perc60, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 60)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+```{r}
+NonessentialAPRs_filtered80 <- GKstats2[(GKstats2$essential==FALSE & GKstats2$avgScore > 80),]
+NonessentialAPRs_filtered80 <- NonessentialAPRs_filtered80[complete.cases(NonessentialAPRs_filtered80),]
+head(NonessentialAPRs_filtered80)
+
+nonessentialAPRcount_filtered80 <- NonessentialAPRs_filtered80 %>%
+  count(charge)
+nonessentialAPRcount_filtered80 <- nonessentialAPRcount_filtered80 %>%
+  mutate(perc80 = n / sum(n) * 100)
+nonessentialAPRcount_filtered80 <- nonessentialAPRcount_filtered80[,-2]
+nonessentialAPRcount_filtered80
+
+ggplot(nonessentialAPRcount_filtered80, aes(x="", y=perc80, fill=charge)) + geom_bar(width=1, stat="identity") + ggtitle("Gatekeeper charge in stronger APRs (Score > 80)") + theme(plot.title=element_text(hjust=0.5)) + coord_polar("y",start=0)
+```
+
+The table below shows the percentage of charged gatekeepers as we filter by TANGO score
+
+```{r}
+nonessentialAPR_counts <- merge(nonessentialAPRcount_noFilter, nonessentialAPRcount_filtered20, by="charge")
+nonessentialAPR_counts <- merge(nonessentialAPR_counts, nonessentialAPRcount_filtered40, by="charge")
+nonessentialAPR_counts <- merge(nonessentialAPR_counts, nonessentialAPRcount_filtered60, by="charge")
+nonessentialAPR_counts <- merge(nonessentialAPR_counts, nonessentialAPRcount_filtered80, by="charge")
+nonessentialAPR_counts
+```
+
+```{r}
+colnames(nonessentialAPRcount_filtered20)[2] <- c('perc')
+colnames(nonessentialAPRcount_filtered40)[2] <- c('perc')
+colnames(nonessentialAPRcount_filtered60)[2] <- c('perc')
+colnames(nonessentialAPRcount_filtered80)[2] <- c('perc')
+
+nonessentialAPR_counts_new <- nonessentialAPR_counts
+nonessentialAPR_counts_new <- nonessentialAPR_counts_new[,c(1,2)]
+nonessentialAPR_counts_new <- rbind(nonessentialAPR_counts_new,nonessentialAPRcount_filtered20,nonessentialAPRcount_filtered40,nonessentialAPRcount_filtered60,nonessentialAPRcount_filtered80)
+nonessentialAPR_counts_new['cutoff'] <- c('perc','perc','perc','perc20','perc20','perc20','perc40','perc40','perc40','perc60','perc60','perc60','perc80','perc80','perc80')
+
+ggplot(data=nonessentialAPR_counts_new, aes(x=charge,y=perc,group=cutoff)) + geom_line(aes(linetype=cutoff)) + geom_point(aes(shape=cutoff)) + ggtitle("Gatekeeper charge distrbution across APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+The graph above shows the percentage of gatekeepers that have no charge overall because of a mix of positive and negative GKs (charge=1), positive (charge=0) and negative (charge=2). The results are similar to that of essential genes.
+
+```{r}
+negativeGK_perc_non <- nonessentialAPR_counts_new[(nonessentialAPR_counts_new$charge==2),]
+negativeGK_perc_non['cutoff_num'] <- c(0,20,40,60,80)
+ggplot(data=negativeGK_perc_non, aes(x=cutoff_num,y=perc)) + geom_line() + geom_point() + ggtitle("Proportion of protective GKs in APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+
+```{r}
+positiveGK_perc_non <- nonessentialAPR_counts_new[(nonessentialAPR_counts_new$charge==0),]
+positiveGK_perc_non['cutoff_num'] <- c(0,20,40,60,80)
+ggplot(data=positiveGK_perc_non, aes(x=cutoff_num,y=perc)) + geom_line() + geom_point() + ggtitle("Proportion of (only) positive GKs in APRs") + theme(plot.title=element_text(hjust=0.5))
+```
+The results of the charged gatekeeper residue analysis results are similar for essential and non-essential genes.
+
+
+# Meltome Analysis
+
+```{r}
+meltome <- read.csv(path_to_meltome)
+```
+
+```{r}
+meltome_df <- meltome %>%
+  group_by(gene_name) %>%
+  summarise(melting_temp = median(meltPoint), 
+            norm_melting_temp = median(quan_norm_meltPoint))
+
+
+meltome_df <- merge(meltome_df, uniprot_mapping, by.x = 'gene_name', by.y='Gene')
+meltome_df <- merge(meltome_df, APRcounts_TANGOscores, by = 'Protein')
+sum(is.na(meltome_df$melting_temp))
+```
+
+```{r}
+p <- ggplot(meltome_df, aes(essential, melting_temp, color = essential))
+p + geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Melting Temperature: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4)
+```
+
+```{r}
+p <- ggplot(meltome_df, aes(essential, norm_melting_temp, color = essential))
+p + geom_boxplot() + stat_summary(fun.y = "mean") +  ggtitle('Normalized Melting Temperature: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4)
+```
+
+```{r}
+means <- ddply(drop_na(meltome_df), "essential", summarise, grp.mean=mean(melting_temp))
+q <- ggplot(meltome_df,aes(x=melting_temp,color=essential))
+q + geom_density(size=0.8) + geom_vline(data=means, aes(xintercept=grp.mean, color=essential), linetype="dashed") + ggtitle("Melting Temperature") + theme(plot.title=element_text(hjust=0.5)) 
+```
+
+```{r}
+means <- ddply(drop_na(meltome_df), "essential", summarise, grp.mean=mean(norm_melting_temp))
+q <- ggplot(meltome_df,aes(x=norm_melting_temp,color=essential))
+q + geom_density(size=0.8) + geom_vline(data=means, aes(xintercept=grp.mean, color=essential), linetype="dashed") + ggtitle("Normalized Melting Temperature") + theme(plot.title=element_text(hjust=0.5))
+```
+
+
+# Chaperone Analysis
+
+## Interactions detected using AP-MS method
+
+```{r}
+chap_AP <- read_excel(path_to_chap_AP)
+chap_BIO <- read_excel(path_to_chap_BIO)
+```
+
+```{r}
+chap_AP <- chap_AP %>%
+  filter(AvgP >= 0.98)
+
+chap_AP <- merge(chap_AP, uniprot_mapping_essential, by.x = 'PreyGene', by.y = 'Gene')
+```
+
+```{r}
+print(paste('essential genes with chaperones percentage: ', sum(chap_AP$essential == TRUE)/nrow(chap_AP)))
+print(paste('total essential genes percentage: ',  sum(uniprot_mapping_essential$essential == TRUE)/nrow(uniprot_mapping_essential)))
+```
+
+```{r}
+chap_AP2 <- merge(chap_AP, Gatekeeper_residues[, c('Protein', 'Residue', 'protein_length', 'APRcount_tango', 'tango_Score', 'avgScore', 'maxProtscore')], by = 'Protein')
+
+chap_AP_df <- chap_AP2 %>%
+  count(Residue, essential) %>%
+  arrange(Residue) %>%
+  mutate(prop=ifelse(essential,
+                     n/nrow(chap_AP2[chap_AP2$essential,]),
+                     n/nrow(chap_AP2[!chap_AP2$essential,])))
+  
+ggplot(chap_AP_df,aes(x=essential, y=prop, fill=Residue)) +
+  geom_bar(stat="identity", width=0.9) +
+  coord_flip() +
+  guides(fill = guide_legend(ncol = 2))
+```
+From the plot above, we can zoom in to the proportion of positive and negative gatekeeper residues in the proteins that are part of the chaperone interactome.
+
+```{r}
+chap_AP_neg_df <- chap_AP_df[(chap_AP_df$Residue=='D'|chap_AP_df$Residue=='E'),]
+chap_AP_pos_df <- chap_AP_df[(chap_AP_df$Residue=='K'|chap_AP_df$Residue=='R'),]
+
+x <- ggplot(chap_AP_neg_df, aes(x=essential, y=prop, fill = Residue)) + geom_bar(stat="identity", width=0.9)
+y <- ggplot(chap_AP_pos_df, aes(x=essential, y=prop, fill = Residue)) + geom_bar(stat="identity", width=0.9)
+ggarrange(x, y + rremove("ylab"), ncol = 2)
+```
+From this plot, we see that the proportion of both positive and negative GK residues is higher in essential genes part of the chaperone interactome, with a greater difference between the positive GKs in essential and nonessential genes rather than negative.
+
+```{r}
+GK_all_pos_neg <- human_proteome_tbl %>%
+  filter(APRcount_tango > 0, APRdef_tango == "GK") %>%
+  select(Protein,APRcount_tango,Residue,Position,avgScore) %>%
+  mutate(negative = if_else(Residue %in% c("D","E"),T,F),
+         positive = if_else(Residue %in% c("R","K"),T,F)) %>%
+  group_by(APRcount_tango) %>%
+  summarise(Protein = Protein,
+            avgScore = avgScore,
+            neg_charge = sum(negative),
+            pos_charge = sum(positive))
+chap_AP_negposGK <- merge(chap_AP,GK_all_pos_neg,by='Protein')
+head(chap_AP_negposGK)
+```
+
+```{r}
+chap_AP_all_neg <- chap_AP_negposGK %>%
+  count(neg_charge, essential) %>%
+  arrange(neg_charge) %>%
+  mutate(prop=ifelse(essential, n/nrow(chap_AP2[chap_AP2$essential,]), n/nrow(chap_AP2[!chap_AP2$essential,])))
+chap_AP_all_pos <- chap_AP_negposGK %>%
+  count(pos_charge, essential) %>%
+  arrange(pos_charge) %>%
+  mutate(prop=ifelse(essential, n/nrow(chap_AP2[chap_AP2$essential,]), n/nrow(chap_AP2[!chap_AP2$essential,])))
+
+m <- ggplot(chap_AP_all_neg,aes(x=essential, y=prop, fill=neg_charge)) + geom_bar(stat="identity", width=0.9) + guides(fill = guide_legend(ncol = 2))
+n <- ggplot(chap_AP_all_pos,aes(x=essential, y=prop, fill=pos_charge)) + geom_bar(stat="identity", width=0.9) + guides(fill = guide_legend(ncol = 2))
+ggarrange(m, n + rremove("ylab"), ncol = 2)
+```
+```{r}
+chap_AP_all_neg
+```
+```{r}
+chap_AP_all_pos
+```
+
+From the graph and tables above, it can be seen that only a small percentage of chaperone-interacting protins contain APRs that are flanked by both positive or both negative gatekeepers.
+
+```{r}
+p <- ggplot(chap_AP, aes(essential, FoldChange, color = essential))
+p +  geom_boxplot(outlier.shape = NA) + stat_summary(fun.y = "median") + ggtitle('Chaperone interations: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 400)  + coord_cartesian(ylim = c(0, 500))
+```
+
+```{r}
+chap_AP3 <- merge(chap_AP, uniprot_mapping, by.x = 'PreyGene', by.y = 'Gene')
+chap_AP3 <- merge(chap_AP, APRcounts_TANGOscores, by = 'Protein')
+
+p <- ggplot(chap_AP3, aes(essential.x, avgTango, color = essential.x))
+p +  geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Chaperone interations Tango scores: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 120) + coord_cartesian(ylim = c(0,120))
+```
+
+```{r}
+p <- ggplot(chap_AP3, aes(essential.x, normalizedAPRcount, color = essential.x))
+p +  geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Chaperone interations APR counts: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 5) + coord_cartesian(ylim = c(0,5))
+```
+
+## Interactions detected using BioID method
+
+```{r}
+chap_BIO <- chap_BIO %>%
+  filter(AvgP >= 0.98)
+
+chap_BIO <- merge(chap_BIO, uniprot_mapping_essential, by.x = 'PreyGene', by.y = 'Gene')
+```
+
+```{r}
+print(paste('essential genes with chaperones percentage: ', sum(chap_BIO$essential == TRUE)/nrow(chap_BIO)))
+print(paste('total essential genes percentage: ',  sum(uniprot_mapping_essential$essential == TRUE)/nrow(uniprot_mapping_essential)))
+```
+
+```{r}
+chap_BIO2 <- merge(chap_BIO, Gatekeeper_residues[, c('Protein', 'Residue', 'protein_length', 'APRcount_tango', 'tango_Score', 'avgScore', 'maxProtscore')], by = 'Protein')
+
+chap_BIO_df <- chap_BIO2 %>%
+  count(Residue, essential) %>%
+  arrange(Residue) %>%
+  mutate(prop=ifelse(essential,
+                     n/nrow(chap_BIO2[chap_BIO2$essential,]),
+                     n/nrow(chap_BIO2[!chap_BIO2$essential,])))
+  
+ggplot(chap_BIO_df,aes(x=essential, y=prop, fill=Residue)) +
+  geom_bar(stat="identity", width=0.9) +
+  coord_flip() +
+  guides(fill = guide_legend(ncol = 2))
+```
+```{r}
+chap_BIO_neg_df <- chap_BIO_df[(chap_BIO_df$Residue=='D'|chap_BIO_df$Residue=='E'),]
+chap_BIO_pos_df <- chap_BIO_df[(chap_BIO_df$Residue=='K'|chap_BIO_df$Residue=='R'),]
+
+x <- ggplot(chap_BIO_neg_df, aes(x=essential, y=prop, fill = Residue)) + geom_bar(stat="identity", width=0.9)
+y <- ggplot(chap_BIO_pos_df, aes(x=essential, y=prop, fill = Residue)) + geom_bar(stat="identity", width=0.9)
+ggarrange(x, y + rremove("ylab"), ncol = 2)
+```
+In this case, nonessential genes have a greater percentage of negative gatekeepers while essential genes have a greater percentage of positive gatekeepers.
+
+```{r}
+chap_BIO_negposGK <- merge(chap_BIO,GK_all_pos_neg,by='Protein')
+head(chap_BIO_negposGK)
+```
+
+```{r}
+chap_BIO_all_neg <- chap_BIO_negposGK %>%
+  count(neg_charge, essential) %>%
+  arrange(neg_charge) %>%
+  mutate(prop=ifelse(essential, n/nrow(chap_BIO2[chap_BIO2$essential,]), n/nrow(chap_BIO2[!chap_BIO2$essential,])))
+chap_BIO_all_pos <- chap_BIO_negposGK %>%
+  count(pos_charge, essential) %>%
+  arrange(pos_charge) %>%
+  mutate(prop=ifelse(essential, n/nrow(chap_BIO2[chap_BIO2$essential,]), n/nrow(chap_BIO2[!chap_BIO2$essential,])))
+
+j <- ggplot(chap_BIO_all_neg,aes(x=essential, y=prop, fill=neg_charge)) + geom_bar(stat="identity", width=0.9) + guides(fill = guide_legend(ncol = 2))
+k <- ggplot(chap_BIO_all_pos,aes(x=essential, y=prop, fill=pos_charge)) + geom_bar(stat="identity", width=0.9) + guides(fill = guide_legend(ncol = 2))
+ggarrange(j, k + rremove("ylab"), ncol = 2)
+```
+Here, charge=2 is when both the gatekeepers on either side are of the same charge (neg/pos).
+
+```{r}
+chap_BIO_all_neg
+```
+```{r}
+chap_BIO_all_pos
+```
+
+```{r}
+p <- ggplot(chap_BIO, aes(essential, FoldChange, color = essential))
+p +  geom_boxplot(outlier.shape = NA) + stat_summary(fun.y = "median") + ggtitle('Chaperone interations: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 400)  + coord_cartesian(ylim = c(0, 500))
+```
+
+```{r}
+chap_BIO3 <- merge(chap_BIO, uniprot_mapping, by.x = 'PreyGene', by.y = 'Gene')
+chap_BIO3 <- merge(chap_BIO, APRcounts_TANGOscores, by = 'Protein')
+
+p <- ggplot(chap_BIO3, aes(essential.x, avgTango, color = essential.x))
+p +  geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Chaperone interations Tango scores: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 120) + coord_cartesian(ylim = c(0,120))
+```
+
+```{r}
+p <- ggplot(chap_BIO3, aes(essential.x, normalizedAPRcount, color = essential.x))
+p +  geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Chaperone interations APR counts: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 5) + coord_cartesian(ylim = c(0,5))
+```
+
+## Combined AP-MS and BioID interactions
+
+```{r}
+chap_C <- rbind(chap_AP,chap_BIO)
+chap_C <- chap_C[!duplicated(chap_C$PreyGene),]
+nrow(chap_C)
+```
+```{r}
+print(paste('essential genes with chaperones percentage: ', sum(chap_C$essential == TRUE)/nrow(chap_C)))
+print(paste('total essential genes percentage: ',  sum(uniprot_mapping_essential$essential == TRUE)/nrow(uniprot_mapping_essential)))
+```
+
+```{r}
+chap_C2 <- merge(chap_C, Gatekeeper_residues[, c('Protein', 'Residue', 'protein_length', 'APRcount_tango', 'tango_Score', 'avgScore', 'maxProtscore')], by = 'Protein')
+
+chap_C_df <- chap_C2 %>%
+  count(Residue, essential) %>%
+  arrange(Residue) %>%
+  mutate(prop=ifelse(essential,
+                     n/nrow(chap_C2[chap_C2$essential,]),
+                     n/nrow(chap_C2[!chap_C2$essential,])))
+  
+ggplot(chap_C_df,aes(x=essential, y=prop, fill=Residue)) +
+  geom_bar(stat="identity", width=0.9) +
+  coord_flip() +
+  guides(fill = guide_legend(ncol = 2))
+```
+```{r}
+chap_C_neg_df <- chap_C_df[(chap_C_df$Residue=='D'|chap_C_df$Residue=='E'),]
+chap_C_pos_df <- chap_C_df[(chap_C_df$Residue=='K'|chap_C_df$Residue=='R'),]
+
+x <- ggplot(chap_C_neg_df, aes(x=essential, y=prop, fill = Residue)) + geom_bar(stat="identity", width=0.9)
+y <- ggplot(chap_C_pos_df, aes(x=essential, y=prop, fill = Residue)) + geom_bar(stat="identity", width=0.9)
+ggarrange(x, y + rremove("ylab"), ncol = 2)
+```
+
+```{r}
+chap_C_negposGK <- merge(chap_C,GK_all_pos_neg,by='Protein')
+head(chap_C_negposGK)
+```
+
+```{r}
+chap_C_all_neg <- chap_C_negposGK %>%
+  count(neg_charge, essential) %>%
+  arrange(neg_charge) %>%
+  mutate(prop=ifelse(essential, n/nrow(chap_C2[chap_C2$essential,]), n/nrow(chap_C2[!chap_C2$essential,])))
+chap_C_all_pos <- chap_C_negposGK %>%
+  count(pos_charge, essential) %>%
+  arrange(pos_charge) %>%
+  mutate(prop=ifelse(essential, n/nrow(chap_C2[chap_C2$essential,]), n/nrow(chap_C2[!chap_C2$essential,])))
+
+j <- ggplot(chap_C_all_neg,aes(x=essential, y=prop, fill=neg_charge)) + geom_bar(stat="identity", width=0.9) + guides(fill = guide_legend(ncol = 2))
+k <- ggplot(chap_C_all_pos,aes(x=essential, y=prop, fill=pos_charge)) + geom_bar(stat="identity", width=0.9) + guides(fill = guide_legend(ncol = 2))
+ggarrange(j, k + rremove("ylab"), ncol = 2)
+```
+```{r}
+chap_C_all_neg
+```
+```{r}
+chap_C_all_pos
+```
+
+```{r}
+p <- ggplot(chap_C, aes(essential, FoldChange, color = essential))
+p +  geom_boxplot(outlier.shape = NA) + stat_summary(fun.y = "median") + ggtitle('Chaperone interations: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 400)  + coord_cartesian(ylim = c(0, 500))
+```
+
+```{r}
+chap_C3 <- merge(chap_C, uniprot_mapping, by.x = 'PreyGene', by.y = 'Gene')
+chap_C3 <- merge(chap_C, APRcounts_TANGOscores, by = 'Protein')
+
+p <- ggplot(chap_C3, aes(essential.x, avgTango, color = essential.x))
+p +  geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Chaperone interations Tango scores: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 120) + coord_cartesian(ylim = c(0,120))
+```
+
+```{r}
+p <- ggplot(chap_C3, aes(essential.x, normalizedAPRcount, color = essential.x))
+p +  geom_boxplot() + stat_summary(fun.y = "median") + ggtitle('Chaperone interations APR counts: Essential vs Non-Essential genes') + theme(plot.title=element_text(hjust=0.5)) + stat_compare_means(comparisons = c("nonessential", "essential")) + stat_compare_means(label.x = 1.4, label.y = 5) + coord_cartesian(ylim = c(0,5))
+```
+
